@@ -56,7 +56,7 @@ const int DXL_DIR_PIN = -1;
 
 #define TOUCH1 0
 
-const uint8_t DXL_ID = 67;
+const uint8_t DXL_ID = 21;
 const float DXL_PROTOCOL_VERSION = 2.0;
 
 // 2つの角度間の最小差分を計算する関数のプロトタイプ宣言
@@ -72,11 +72,16 @@ using namespace ControlTableItem;
 // タッチセンサーの状態を管理する変数
 bool touchState = false;
 bool prevTouchState = false;
-bool rotationDirection = true; // true: 時計回り, false: 反時計回り
+bool rotationDirection = true; // true: 反時計回り, false: 時計回り
 
 // ポジションモードでの設定
-const float TARGET_ANGLE = 180.0;     // 目標回転角度
-const float POSITION_THRESHOLD = 5.0; // 位置判定のしきい値（度）
+const float TARGET_ANGLE = 180.0;           // 目標回転角度
+const float POSITION_THRESHOLD = 1.0;       // 位置判定のしきい値（度）
+const float APPROACH_THRESHOLD = 10.0;      // 接近判定のしきい値（度）
+const int32_t GOAL_CURRENT_LIMIT = 1000;    // 電流制限値（mA）
+const int32_t APPROACH_CURRENT_LIMIT = 300; // 接近時の電流制限値（mA）
+const int32_t CURRENT_THRESHOLD = 500;      // 電流検出しきい値（mA）
+const float VELOCITY = 10.0;                // 回転速度（RPM）
 
 // サーボの状態
 enum ServoState
@@ -99,42 +104,34 @@ void setup()
 {
   // Use UART port of DYNAMIXEL Shield to debug.
   DEBUG_SERIAL.begin(115200);
-  delay(2000); // シリアル接続の安定化のために少し待機
 
-  DEBUG_SERIAL.println("セットアップを開始します");
-
-  pinMode(TOUCH1, INPUT);
-
-  // Set Port baudrate to 1000000bps. This has to match with DYNAMIXEL baudrate.
-  dxl.begin(1000000); // 1000000
   // Set Port Protocol Version. This has to match with DYNAMIXEL protocol version.
   dxl.setPortProtocolVersion(DXL_PROTOCOL_VERSION);
   // Get DYNAMIXEL information
-  dxl.ping(DXL_ID);
+  dxl.begin(1000000);
 
-  // Turn off torque when configuring items in EEPROM area
+  // トルクをオフにする（操作モード変更のため）
   dxl.torqueOff(DXL_ID);
+  delay(100);
 
-  // ポジションモードに設定
-  dxl.setOperatingMode(DXL_ID, OP_POSITION);
+  // Set operating mode to current mode
+  dxl.setOperatingMode(DXL_ID, OP_CURRENT);
+  delay(100);
 
-  // トルク制限を設定（最大値の100%）
-  dxl.writeControlTableItem(GOAL_CURRENT, DXL_ID, 2047);
+  // タッチセンサーピンを入力に設定
+  pinMode(TOUCH1, INPUT_PULLDOWN);
 
-  // 速度制限を設定（最大値）
-  dxl.writeControlTableItem(PROFILE_VELOCITY, DXL_ID, 0); // 0は無制限を意味します
-
-  // 加速度プロファイルを設定
-  dxl.writeControlTableItem(PROFILE_ACCELERATION, DXL_ID, 0); // 0は無制限を意味します
-
-  // 初期位置を記録
+  // 初期位置を取得
+  dxl.torqueOff(DXL_ID);
+  delay(100);
   initialPosition = dxl.getPresentPosition(DXL_ID, UNIT_DEGREE);
+
+  // 初期設定完了メッセージ
+  DEBUG_SERIAL.println("セットアップを開始します");
   DEBUG_SERIAL.print("初期位置(度): ");
   DEBUG_SERIAL.println(initialPosition);
-
-  // スタート時点ではトルクをオフにしておく
   DEBUG_SERIAL.println("サーボの初期化完了。トルクはオフ状態です。");
-  DEBUG_SERIAL.println("タッチセンサーを押すと時計回りに180度回転します。");
+  DEBUG_SERIAL.println("タッチセンサーを押すと反時計回りに180度回転します。");
 }
 
 void loop()
@@ -152,6 +149,14 @@ void loop()
   switch (currentState)
   {
   case IDLE:
+    // if (currentTime - lastCheckTime >= 100)
+    // {
+    //   // チェック時間を更新
+    //   lastCheckTime = currentTime;
+    //   DEBUG_SERIAL.print("現在位置(度): ");
+    //   DEBUG_SERIAL.println(currentPosition);
+    // }
+
     // タッチセンサーの状態が変化した場合
     if (touchState && !prevTouchState)
     {
@@ -164,17 +169,16 @@ void loop()
       // トルクがオンになるまで少し待機
       delay(100);
 
-      // 現在位置を取得（ログ用）
-      float currentPos = dxl.getPresentPosition(DXL_ID, UNIT_DEGREE);
-      DEBUG_SERIAL.print("現在位置(度): ");
-      DEBUG_SERIAL.println(currentPos);
-
       // 初期位置を基準にして目標位置を計算（固定位置に移動）
       if (rotationDirection)
       {
-        // 時計回り位置（初期位置+180度）
-        DEBUG_SERIAL.println("時計回り位置に移動します");
+        // 反時計回り位置（初期位置+180度）
+        DEBUG_SERIAL.println("反時計回り回転を開始します");
         targetPosition = normalizeAngle(initialPosition + TARGET_ANGLE);
+        // 反時計回りに回転するための電流値を設定（正の値）
+        dxl.setGoalCurrent(DXL_ID, GOAL_CURRENT_LIMIT);
+        DEBUG_SERIAL.print("設定電流値(mA): ");
+        DEBUG_SERIAL.println(GOAL_CURRENT_LIMIT);
         DEBUG_SERIAL.print("初期位置(度): ");
         DEBUG_SERIAL.println(initialPosition);
         DEBUG_SERIAL.print("目標位置(度): ");
@@ -182,24 +186,17 @@ void loop()
       }
       else
       {
-        // 反時計回り位置（初期位置-180度）
-        DEBUG_SERIAL.println("反時計回り位置に移動します");
+        // 時計回り位置（初期位置-180度）
+        DEBUG_SERIAL.println("時計回り回転を開始します");
         targetPosition = normalizeAngle(initialPosition);
+        // 時計回りに回転するための電流値を設定（負の値）
+        dxl.setGoalCurrent(DXL_ID, -GOAL_CURRENT_LIMIT);
+        DEBUG_SERIAL.print("設定電流値(mA): ");
+        DEBUG_SERIAL.println(-GOAL_CURRENT_LIMIT);
         DEBUG_SERIAL.print("初期位置(度): ");
         DEBUG_SERIAL.println(initialPosition);
         DEBUG_SERIAL.print("目標位置(度): ");
         DEBUG_SERIAL.println(targetPosition);
-      }
-
-      // 目標位置を設定
-      dxl.setGoalPosition(DXL_ID, targetPosition, UNIT_DEGREE);
-
-      // トルクが確実にオンになっていいるか確認（TORQUE_ENABLEの値を読み取る）
-      if (dxl.readControlTableItem(TORQUE_ENABLE, DXL_ID) != 1)
-      {
-        DEBUG_SERIAL.println("トルクが正しく設定されていません。再設定します。");
-        dxl.torqueOn(DXL_ID);
-        delay(50);
       }
 
       // 状態を回転中に変更
@@ -213,15 +210,21 @@ void loop()
 
   case ROTATING:
     // 100msごとに位置を確認（前回のチェックから100ms以上経過したら）
-    if (currentTime - lastCheckTime >= 100)
+    if (currentTime - lastCheckTime >= 10)
     {
       // チェック時間を更新
       lastCheckTime = currentTime;
+
+      // 現在の位置と電流値を取得
+      float currentPosition = dxl.getPresentPosition(DXL_ID, UNIT_DEGREE);
+      int16_t currentCurrent = dxl.readControlTableItem(PRESENT_CURRENT, DXL_ID);
 
       DEBUG_SERIAL.print("現在位置(度): ");
       DEBUG_SERIAL.println(currentPosition);
       DEBUG_SERIAL.print("目標位置(度): ");
       DEBUG_SERIAL.println(targetPosition);
+      DEBUG_SERIAL.print("現在電流(mA): ");
+      DEBUG_SERIAL.println(currentCurrent);
 
       // 目標位置までの角度差を計算
       float angleDiff = calculateAngleDifference(currentPosition, targetPosition);
@@ -230,14 +233,49 @@ void loop()
       DEBUG_SERIAL.print("目標までの差(度): ");
       DEBUG_SERIAL.println(angleDiff);
 
-      // 目標位置に近づいた場合に停止
-      if (angleDiff < POSITION_THRESHOLD)
+      // 目標位置に近づいたら電流値を下げてスピードを調整
+      if (angleDiff < APPROACH_THRESHOLD && angleDiff >= POSITION_THRESHOLD)
       {
-        // トルクをオフにする
+        // 接近モードに入ったことを通知
+        if (abs(currentCurrent) > APPROACH_CURRENT_LIMIT)
+        {
+          if (rotationDirection)
+          {
+            // 反時計回り（正の電流値）を維持しながら電流値を下げる
+            dxl.setGoalCurrent(DXL_ID, APPROACH_CURRENT_LIMIT);
+            DEBUG_SERIAL.println("目標に接近: 電流値を下げました（反時計回り）");
+          }
+          else
+          {
+            // 時計回り（負の電流値）を維持しながら電流値を下げる
+            dxl.setGoalCurrent(DXL_ID, -APPROACH_CURRENT_LIMIT);
+            DEBUG_SERIAL.println("目標に接近: 電流値を下げました（時計回り）");
+          }
+          DEBUG_SERIAL.print("調整後電流値(mA): ");
+          DEBUG_SERIAL.println(APPROACH_CURRENT_LIMIT);
+        }
+      }
+
+      // 目標位置に到達した場合、または電流値が閾値を超えた場合に停止
+      if (angleDiff < POSITION_THRESHOLD || abs(currentCurrent) > CURRENT_THRESHOLD)
+      {
+        // 停止理由を表示
+        if (angleDiff < POSITION_THRESHOLD)
+        {
+          DEBUG_SERIAL.println("目標角度に到達しました");
+        }
+        else
+        {
+          DEBUG_SERIAL.println("電流値が閾値を超えました - 障害物検出");
+        }
+
+        // 電流を0に設定して停止
+        dxl.setGoalCurrent(DXL_ID, 0);
         delay(300);
+
+        // トルクをオフにする
         dxl.torqueOff(DXL_ID);
 
-        DEBUG_SERIAL.println("目標角度に到達しました");
         DEBUG_SERIAL.println("回転完了。トルクをオフにしました");
 
         // 次回は逆方向に回転するよう設定
@@ -245,11 +283,11 @@ void loop()
 
         if (rotationDirection)
         {
-          DEBUG_SERIAL.println("次回タッチで時計回り回転します");
+          DEBUG_SERIAL.println("次回タッチで反時計回り回転します");
         }
         else
         {
-          DEBUG_SERIAL.println("次回タッチで反時計回り回転します");
+          DEBUG_SERIAL.println("次回タッチで時計回り回転します");
         }
 
         // 状態を待機中に戻す
@@ -284,7 +322,7 @@ void loop()
   }
 
   // 少し待機
-  delay(10);
+  // delay(10);
 }
 
 // 2つの角度間の最小差分を計算する関数（0〜360度の範囲で）
